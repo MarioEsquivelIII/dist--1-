@@ -1,332 +1,693 @@
-"""
-Tournament agent for CS3600 Spring 2026.
-
-Strategy:
-  - HMM (via RatBelief) tracks the rat using noise and distance observations.
-  - Negamax with alpha-beta pruning (iterative deepening) chooses board moves.
-  - Each turn we decide: search for rat (if expected value is high enough) OR
-    make the best board move found by the search.
-  - Heuristic: score differential + carpet potential + weighted primed runway.
-"""
-
-from collections.abc import Callable
-from typing import Tuple
-import time
-
+import random
 import numpy as np
+import time as time_module
+from collections.abc import Callable
 
-from game import board as board_mod, move as move_mod
-from game.enums import (
-    Direction, MoveType, Cell,
-    BOARD_SIZE, CARPET_POINTS_TABLE,
-    loc_after_direction,
-)
+from game import board as board_module
+from game import enums
+from game.enums import Direction, MoveType, Cell, BOARD_SIZE, CARPET_POINTS_TABLE
 from game.move import Move
 
-from .rat_belief import RatBelief
 
+DIRECTIONS = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
+OPPOSITE = {
+    Direction.UP: Direction.DOWN,
+    Direction.DOWN: Direction.UP,
+    Direction.LEFT: Direction.RIGHT,
+    Direction.RIGHT: Direction.LEFT,
+}
 
-# ---------------------------------------------------------------------------
-# Heuristic weights (tunable)
-# ---------------------------------------------------------------------------
-W_SCORE      = 1.0   # score difference
-W_MY_CARPET  = 0.45  # my best available carpet value
-W_OPP_CARPET = 0.25  # opponent's best carpet value (penalty)
-W_RUNWAY     = 0.08  # my total primed squares in reach
+DIR_DELTAS = {
+    Direction.UP: (0, -1),
+    Direction.DOWN: (0, 1),
+    Direction.LEFT: (-1, 0),
+    Direction.RIGHT: (1, 0),
+}
 
-# Search threshold: only search when EV > this value
-# EV = 6*P - 2;  EV > THRESHOLD  ↔  P > (THRESHOLD + 2) / 6
-SEARCH_EV_THRESHOLD = 1.2
+# For fast iteration without dict lookup
+DIR_LIST = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # UP, DOWN, LEFT, RIGHT
 
-# Max moves to consider at each node (top-K after ordering)
-MAX_MOVES_PER_NODE = 18
+# Noise emission probabilities: Cell type -> noise index -> probability
+NOISE_TABLE = np.array([
+    [0.7,  0.15, 0.15],  # SPACE=0
+    [0.1,  0.8,  0.1 ],  # PRIMED=1
+    [0.1,  0.1,  0.8 ],  # CARPET=2
+    [0.5,  0.3,  0.2 ],  # BLOCKED=3
+], dtype=np.float64)
 
-# Keep at least this many seconds in reserve before timing out
-TIME_BUFFER = 8.0
+# Carpet points lookup (index = roll length)
+CARPET_PTS = [0, -1, 2, 4, 6, 10, 15, 21]
 
 
 class PlayerAgent:
-    """
-    Required entry points: __init__, commentate, play.
-    """
+    def __init__(self, board_state, transition_matrix=None, time_left: Callable = None):
+        self._init_ok = False
+        try:
+            self._real_init(board_state, transition_matrix)
+            self._init_ok = True
+        except Exception:
+            pass
 
-    def __init__(self, board, transition_matrix=None, time_left: Callable = None):
-        self.rat_belief = RatBelief(transition_matrix)
-        self.turn_number = 0          # counts our own turns (0-indexed)
-        self._prev_opp_search = (None, False)
-
-    # ------------------------------------------------------------------
-    def commentate(self):
-        best_cell, best_prob = self.rat_belief.get_best_cell()
-        return f"Turn {self.turn_number} | rat belief peak {best_prob:.3f} @ {best_cell}"
-
-    # ------------------------------------------------------------------
-    def play(self, board, sensor_data: Tuple, time_left: Callable):
-        noise, observed_dist = sensor_data
-        worker_pos = board.player_worker.get_location()
-
-        # ---- 1. Update rat HMM (order matters!) -----------------------
-        # Rat moves once per game-turn. We play every other game-turn.
-        # The rat resets (1000-step spawn) whenever EITHER player catches it.
-        #
-        # Case A: We caught the rat on our LAST turn.
-        #   → new rat: 1000 spawn moves, then 1 move before opp turn, 1 before ours
-        #   → reset belief, predict() × 2
-        #
-        # Case B: Opponent caught the rat on THEIR last turn.
-        #   → new rat: 1000 spawn moves, then 1 move before our turn
-        #   → reset belief, predict() × 1
-        #
-        # Case C: No catch (normal).
-        #   → rat moved once before opp turn + once before our turn  (2 moves)
-        #   → but on turn_number == 0 the rat only moved once before us
-        #   → predict() × (1 if first turn else 2)
-
-        my_loc, my_found = board.player_search
-        opp_loc, opp_found = board.opponent_search
-        opp_search_new = (opp_loc is not None and
-                          opp_loc != self._prev_opp_search[0])
-
-        if my_found and my_loc is not None:
-            # We caught rat last turn; reset, then 2 more rat moves.
-            self.rat_belief.reset_to_spawn()
-            n_predict = 2
-        elif opp_search_new and opp_found:
-            # Opponent caught rat on their last turn; reset, then 1 rat move.
-            self.rat_belief.reset_to_spawn()
-            n_predict = 1
+    def _real_init(self, board_state, transition_matrix):
+        # --- Transition Matrix Setup ---
+        if transition_matrix is not None:
+            try:
+                self.T = np.array(transition_matrix, dtype=np.float64)
+            except Exception:
+                self.T = np.array(
+                    [[float(transition_matrix[i][j]) for j in range(64)] for i in range(64)],
+                    dtype=np.float64,
+                )
         else:
-            n_predict = 1 if self.turn_number == 0 else 2
+            self.T = np.eye(64, dtype=np.float64)
 
-        for _ in range(n_predict):
-            self.rat_belief.predict()
+        # Compute stationary distribution
+        T_1000 = np.linalg.matrix_power(self.T, 1000)
+        self.stationary = T_1000[0].copy()
+        s = self.stationary.sum()
+        self.stationary = self.stationary / s if s > 0 else np.ones(64) / 64
 
-        self.rat_belief.update(noise, observed_dist, worker_pos, board)
+        self.belief = self.stationary.copy()
+        self.first_turn = True
+        self.turn_number = 0
 
-        # Incorporate opponent's negative search (cell ruled out).
-        if opp_search_new and not opp_found:
-            self.rat_belief.update_from_search(opp_loc, False)
+        # --- Precompute Manhattan Distances ---
+        coords = np.array([(i % 8, i // 8) for i in range(64)])
+        self.manhattan = np.abs(
+            coords[:, None, :] - coords[None, :, :]
+        ).sum(axis=2).astype(np.int32)
 
-        self._prev_opp_search = (opp_loc, opp_found)
-        self.turn_number += 1
+        # --- Distance Observation Likelihood Table ---
+        max_d = 14
+        self.dist_like = np.zeros((max_d + 3, max_d + 1), dtype=np.float64)
+        for actual in range(max_d + 1):
+            for offset, prob in zip([-1, 0, 1, 2], [0.12, 0.70, 0.12, 0.06]):
+                reported = max(0, actual + offset)
+                if reported < self.dist_like.shape[0]:
+                    self.dist_like[reported, actual] += prob
 
-        # ---- 2. Rat search decision -----------------------------------
-        best_rat_cell, best_rat_prob = self.rat_belief.get_best_cell()
-        search_ev = 6.0 * best_rat_prob - 2.0   # E[points] from searching best cell
+        # Precompute blocked mask
+        self._blocked = board_state._blocked_mask
 
-        turns_left = board.player_worker.turns_left
-        time_remaining = time_left()
+        # --- Precompute static board potential ---
+        self.static_potential = [[0]*8 for _ in range(8)]
+        for y in range(8):
+            for x in range(8):
+                if self._blocked & (1 << (y * 8 + x)):
+                    continue
+                h_len = 1
+                lx = x - 1
+                while lx >= 0 and not (self._blocked & (1 << (y * 8 + lx))):
+                    h_len += 1
+                    lx -= 1
+                rx = x + 1
+                while rx < 8 and not (self._blocked & (1 << (y * 8 + rx))):
+                    h_len += 1
+                    rx += 1
+                v_len = 1
+                uy = y - 1
+                while uy >= 0 and not (self._blocked & (1 << (uy * 8 + x))):
+                    v_len += 1
+                    uy -= 1
+                dy_ = y + 1
+                while dy_ < 8 and not (self._blocked & (1 << (dy_ * 8 + x))):
+                    v_len += 1
+                    dy_ += 1
+                self.static_potential[y][x] = min(max(h_len, v_len), 7)
 
-        # Compare search EV against expected board move value.
-        valid_moves = board.get_valid_moves(exclude_search=True)
+        # Transposition table
+        self.tt = {}
 
-        if search_ev > SEARCH_EV_THRESHOLD:
-            best_board_imm = self._best_immediate_value(valid_moves)
-            if search_ev >= best_board_imm or best_rat_prob > 0.72:
-                return Move.search(best_rat_cell)
+    def commentate(self):
+        return ""
 
-        if not valid_moves:
-            # Completely blocked; must search somewhere.
-            return Move.search(best_rat_cell)
+    # =========================================================================
+    # HMM Rat Tracker
+    # =========================================================================
 
-        # ---- 3. Board move via iterative-deepening negamax ------------
-        safe_time = max(0.0, time_remaining - TIME_BUFFER)
-        time_per_turn = safe_time / max(turns_left, 1)
-        search_time = min(time_per_turn * 0.80, 4.5)
+    def _apply_transition_with_opp_search(self, opp_search):
+        self.belief = self.belief @ self.T
+        if opp_search[0] is not None and not opp_search[1]:
+            idx = opp_search[0][1] * 8 + opp_search[0][0]
+            self.belief[idx] = 0.0
+            s = self.belief.sum()
+            if s > 0:
+                self.belief /= s
 
-        return self._choose_move(board, valid_moves, search_time)
+    def _update_hmm(self, board_state, sensor_data):
+        if board_state.opponent_search[1]:
+            self.belief = self.stationary.copy()
+            self.belief = self.belief @ self.T
+        elif board_state.player_search[1]:
+            self.belief = self.stationary.copy()
+            self._apply_transition_with_opp_search(board_state.opponent_search)
+            self.belief = self.belief @ self.T
+        elif self.first_turn and board_state.turn_count == 0:
+            self.first_turn = False
+            self.belief = self.belief @ self.T
+        else:
+            self.first_turn = False
+            self._apply_transition_with_opp_search(board_state.opponent_search)
+            self.belief = self.belief @ self.T
 
-    # ------------------------------------------------------------------
-    # Move selection
-    # ------------------------------------------------------------------
+        noise_idx = int(sensor_data[0])
+        est_d = int(sensor_data[1])
 
-    def _choose_move(self, board, valid_moves, time_budget: float):
-        start = time.time()
+        blocked = board_state._blocked_mask
+        primed = board_state._primed_mask
+        carpet = board_state._carpet_mask
+        cell_types = np.zeros(64, dtype=np.int32)
+        for j in range(64):
+            bit = 1 << j
+            if blocked & bit:
+                cell_types[j] = 3
+            elif primed & bit:
+                cell_types[j] = 1
+            elif carpet & bit:
+                cell_types[j] = 2
 
-        # Greedy baseline (depth-0).
-        best_move = self._greedy_pick(valid_moves)
+        self.belief *= NOISE_TABLE[cell_types, noise_idx]
 
-        for depth in range(1, 7):
-            elapsed = time.time() - start
-            if elapsed >= time_budget * 0.55:
-                break
-            move, _ = self._negamax(
-                board, depth,
-                float('-inf'), float('inf'),
-                start, time_budget * 0.92
-            )
-            if move is not None:
-                best_move = move
-            if time.time() - start >= time_budget:
-                break
+        w_pos = board_state.player_worker.get_location()
+        w_idx = w_pos[1] * 8 + w_pos[0]
+        actual_dists = self.manhattan[w_idx]
 
-        return best_move
+        if est_d < self.dist_like.shape[0]:
+            safe_dists = np.minimum(actual_dists, self.dist_like.shape[1] - 1)
+            dist_lik = self.dist_like[est_d, safe_dists]
+            dist_lik[actual_dists >= self.dist_like.shape[1]] = 0
+            self.belief *= dist_lik
 
-    def _negamax(self, board, depth, alpha, beta, start_time, deadline):
-        """
-        Negamax with alpha-beta pruning.
-        Returns (best_move, value_for_current_player).
-        After reverse_perspective(), player_worker is the side to move.
-        """
-        if time.time() - start_time > deadline:
-            return None, self._heuristic(board)
+        self.belief = self.belief * 0.995 + 0.005 / 64
+        total = self.belief.sum()
+        self.belief = self.belief / total if total > 1e-300 else np.ones(64) / 64
 
-        if depth == 0 or board.is_game_over():
-            return None, self._heuristic(board)
+    # =========================================================================
+    # Board Scanning Helpers
+    # =========================================================================
 
-        valid_moves = board.get_valid_moves(exclude_search=True)
-        if not valid_moves:
-            return None, self._heuristic(board)
-
-        # Order and limit moves for efficiency.
-        ordered = self._order_moves(valid_moves, board)[:MAX_MOVES_PER_NODE]
-
-        best_move = ordered[0]
-        best_val  = float('-inf')
-
-        for m in ordered:
-            if time.time() - start_time > deadline:
-                break
-
-            child = board.forecast_move(m, check_ok=False)
-            if child is None:
-                continue
-            child.reverse_perspective()
-
-            _, val = self._negamax(child, depth - 1, -beta, -alpha,
-                                   start_time, deadline)
-            val = -val   # negate: child returns value for *that* player
-
-            if val > best_val:
-                best_val = val
-                best_move = m
-            alpha = max(alpha, best_val)
-            if beta <= alpha:
-                break   # alpha-beta cutoff
-
-        return best_move, best_val
-
-    # ------------------------------------------------------------------
-    # Heuristic
-    # ------------------------------------------------------------------
-
-    def _heuristic(self, board):
-        """
-        Evaluate from the current player's perspective.
-        After an even number of reverse_perspective() calls, player_worker
-        is our actual worker; after an odd number it is the opponent's.
-        Negamax handles the sign flip automatically.
-        """
-        my_pts  = board.player_worker.get_points()
-        opp_pts = board.opponent_worker.get_points()
-        score_diff = float(my_pts - opp_pts)
-
-        my_pos  = board.player_worker.get_location()
-        opp_pos = board.opponent_worker.get_location()
-
-        my_carpet,  my_reach  = self._carpet_stats(board, my_pos)
-        opp_carpet, opp_reach = self._carpet_stats(board, opp_pos)
-
-        return (W_SCORE     * score_diff
-                + W_MY_CARPET  * my_carpet
-                - W_OPP_CARPET * opp_carpet
-                + W_RUNWAY     * (my_reach - opp_reach))
-
-    def _carpet_stats(self, board, pos):
-        """
-        From `pos`, scan 4 directions for contiguous primed squares.
-        Returns (best_carpet_value, total_primed_squares_reachable).
-        """
-        pm = board._primed_mask
-        pw = board.player_worker.get_location()
-        ow = board.opponent_worker.get_location()
-
-        best_val = 0
-        total    = 0
-
-        for direction in Direction:
-            count = 0
-            cur = pos
-            while count < BOARD_SIZE - 1:
-                nxt = loc_after_direction(cur, direction)
-                if not board.is_valid_cell(nxt):
-                    break
-                bit = 1 << (nxt[1] * BOARD_SIZE + nxt[0])
-                if not (pm & bit):
-                    break
-                if nxt == pw or nxt == ow:
-                    break
-                count += 1
-                cur = nxt
-
-            total += count
-            if 1 <= count <= 7:
-                v = CARPET_POINTS_TABLE[count]
-                if v > best_val:
-                    best_val = v
-
-        return float(best_val), float(total)
-
-    # ------------------------------------------------------------------
-    # Move ordering & helpers
-    # ------------------------------------------------------------------
-
-    def _order_moves(self, moves, board):
-        """Sort moves: high-value carpet first, then prime, then plain."""
-        def key(m):
-            if m.move_type == MoveType.CARPET:
-                # Higher carpet length → lower sort key (goes first).
-                return -float(CARPET_POINTS_TABLE.get(m.roll_length, 0))
-            elif m.move_type == MoveType.PRIME:
-                # Prime toward the longest run of existing primed squares.
-                pos = board.player_worker.get_location()
-                nxt = loc_after_direction(pos, m.direction)
-                run = self._primed_run_after(board, nxt, m.direction)
-                return -(0.5 + 0.1 * run)
-            else:
-                # Plain: prefer moving toward primed clusters (rough heuristic).
-                return 0.0
-        return sorted(moves, key=key)
-
-    def _primed_run_after(self, board, start, direction):
-        """Count consecutive primed squares starting at `start` in `direction`."""
+    def _count_primes_dir(self, primed, x, y, dx, dy, opp_x, opp_y, my_x, my_y):
         count = 0
-        cur = start
-        pm = board._primed_mask
-        while count < BOARD_SIZE - 1:
-            bit = 1 << (cur[1] * BOARD_SIZE + cur[0])
-            if not (pm & bit):
+        cx, cy = x + dx, y + dy
+        while 0 <= cx < 8 and 0 <= cy < 8:
+            if (cx == opp_x and cy == opp_y) or (cx == my_x and cy == my_y):
+                break
+            if not (primed & (1 << (cy * 8 + cx))):
                 break
             count += 1
-            nxt = loc_after_direction(cur, direction)
-            if not board.is_valid_cell(nxt):
-                break
-            cur = nxt
+            cx += dx
+            cy += dy
         return count
 
-    def _greedy_pick(self, valid_moves):
-        """Return the highest-immediate-value move (fast, no tree search)."""
-        best_move = valid_moves[0]
-        best_val  = float('-inf')
-        for m in valid_moves:
-            v = self._immediate_value(m)
-            if v > best_val:
-                best_val = v
-                best_move = m
+    # =========================================================================
+    # Precompute per-turn data
+    # =========================================================================
+
+    def _precompute_position_scores(self, bs):
+        carpet = bs._carpet_mask
+        primed = bs._primed_mask
+        blocked = bs._blocked_mask
+        self._pos_quality = [[0.0]*8 for _ in range(8)]
+        for y in range(8):
+            for x in range(8):
+                pot = self.static_potential[y][x]
+                if pot < 3:
+                    continue
+                bit = 1 << (y * 8 + x)
+                if carpet & bit:
+                    continue
+                self._pos_quality[y][x] = CARPET_PTS[pot] if pot <= 7 else 21
+
+        # Precompute prime segment proximity advantage
+        my_x, my_y = bs.player_worker.get_location()
+        opp_x, opp_y = bs.opponent_worker.get_location()
+        self._prime_proximity_adv = 0.0
+
+        for axis in range(2):  # 0=horizontal, 1=vertical
+            for outer in range(8):
+                inner = 0
+                while inner < 8:
+                    y, x = (outer, inner) if axis == 0 else (inner, outer)
+                    if primed & (1 << (y * 8 + x)):
+                        start = inner
+                        while inner < 8:
+                            y2, x2 = (outer, inner) if axis == 0 else (inner, outer)
+                            if not (primed & (1 << (y2 * 8 + x2))):
+                                break
+                            inner += 1
+                        seg_len = inner - start
+                        if seg_len >= 2:
+                            pts = CARPET_PTS[min(seg_len, 7)]
+                            if pts > 0:
+                                my_d = opp_d = 99
+                                for end_inner in (start - 1, inner):
+                                    ey, ex = (outer, end_inner) if axis == 0 else (end_inner, outer)
+                                    if 0 <= ex < 8 and 0 <= ey < 8 and not (blocked & (1 << (ey * 8 + ex))):
+                                        my_d = min(my_d, abs(ex - my_x) + abs(ey - my_y))
+                                        opp_d = min(opp_d, abs(ex - opp_x) + abs(ey - opp_y))
+                                if my_d < 99:
+                                    self._prime_proximity_adv += pts * (1.0/(opp_d+1) - 1.0/(my_d+1)) * 0.15
+                    else:
+                        inner += 1
+
+    # =========================================================================
+    # Heuristic Evaluation
+    # =========================================================================
+
+    def _heuristic(self, bs, is_my_turn):
+        if is_my_turn:
+            my_w, opp_w = bs.player_worker, bs.opponent_worker
+        else:
+            my_w, opp_w = bs.opponent_worker, bs.player_worker
+
+        my_x, my_y = my_w.get_location()
+        opp_x, opp_y = opp_w.get_location()
+        primed = bs._primed_mask
+        blocked = bs._blocked_mask
+        carpet = bs._carpet_mask
+        occupied = primed | carpet | blocked
+
+        my_pts = my_w.get_points()
+        opp_pts = opp_w.get_points()
+        turns_left = my_w.turns_left
+
+        # ---- 1. Score margin ----
+        score_diff = float(my_pts - opp_pts)
+        if turns_left <= 3:
+            val = score_diff * 2.5
+        elif turns_left <= 8:
+            val = score_diff * 1.8
+        elif turns_left <= 20:
+            val = score_diff * 1.3
+        else:
+            val = score_diff * 1.0
+
+        # ---- 2. Immediate carpet potential ----
+        my_best_carpet = 0
+        my_second_carpet = 0
+        opp_best_carpet = 0
+
+        for dx, dy in DIR_LIST:
+            length = self._count_primes_dir(primed, my_x, my_y, dx, dy, opp_x, opp_y, my_x, my_y)
+            if length >= 1:
+                pts = CARPET_PTS[min(length, 7)]
+                if pts > my_best_carpet:
+                    my_second_carpet = my_best_carpet
+                    my_best_carpet = pts
+                elif pts > my_second_carpet:
+                    my_second_carpet = pts
+
+            length = self._count_primes_dir(primed, opp_x, opp_y, dx, dy, opp_x, opp_y, my_x, my_y)
+            if length >= 1:
+                pts = CARPET_PTS[min(length, 7)]
+                if pts > opp_best_carpet:
+                    opp_best_carpet = pts
+
+        # Value carpet potential highly - near-guaranteed points next move
+        val += my_best_carpet * 0.90
+        val += my_second_carpet * 0.15
+        val -= opp_best_carpet * 0.85
+
+        # ---- 3. Building potential (phase-aware) ----
+        if turns_left <= 2:
+            build_factor = 0.0
+        elif turns_left <= 5:
+            build_factor = 0.15
+        elif turns_left <= 10:
+            build_factor = 0.30
+        else:
+            build_factor = 0.40
+
+        my_bit = 1 << (my_y * 8 + my_x)
+        on_space = not bool(occupied & my_bit)
+
+        best_build = 0.0
+        if on_space and build_factor > 0:
+            for i in range(4):
+                dx, dy = DIR_LIST[i]
+                odx, ody = DIR_LIST[i ^ 1]
+                primes_behind = self._count_primes_dir(primed, my_x, my_y, odx, ody, opp_x, opp_y, my_x, my_y)
+
+                spaces_ahead = 0
+                cx, cy = my_x + dx, my_y + dy
+                while 0 <= cx < 8 and 0 <= cy < 8:
+                    if cx == opp_x and cy == opp_y:
+                        break
+                    if occupied & (1 << (cy * 8 + cx)):
+                        break
+                    spaces_ahead += 1
+                    cx += dx
+                    cy += dy
+
+                future_line = primes_behind + 1 + spaces_ahead
+                if future_line >= 2:
+                    if primes_behind >= 1:
+                        build_val = CARPET_PTS[min(primes_behind + 1, 7)] * build_factor
+                    else:
+                        build_val = CARPET_PTS[min(future_line, 7)] * build_factor * 0.30
+                    if build_val > best_build:
+                        best_build = build_val
+        val += best_build
+
+        # ---- 4. Opponent building potential (threat) ----
+        opp_bit = 1 << (opp_y * 8 + opp_x)
+        if not bool(occupied & opp_bit):
+            for i in range(4):
+                odx, ody = DIR_LIST[i ^ 1]
+                pb = self._count_primes_dir(primed, opp_x, opp_y, odx, ody, opp_x, opp_y, my_x, my_y)
+                if pb >= 1:
+                    val -= CARPET_PTS[min(pb + 1, 7)] * 0.35
+
+        # ---- 5. Position quality ----
+        val += self._pos_quality[my_y][my_x] * 0.03
+        val -= self._pos_quality[opp_y][opp_x] * 0.02
+        for dx, dy in DIR_LIST:
+            nx, ny = my_x + dx, my_y + dy
+            if 0 <= nx < 8 and 0 <= ny < 8:
+                val += self._pos_quality[ny][nx] * 0.01
+
+        # ---- 6. Mobility ----
+        mob = 0
+        for dx, dy in DIR_LIST:
+            nx, ny = my_x + dx, my_y + dy
+            if 0 <= nx < 8 and 0 <= ny < 8:
+                nbit = 1 << (ny * 8 + nx)
+                if not ((blocked | primed) & nbit):
+                    if not (nx == opp_x and ny == opp_y):
+                        mob += 1
+        val += mob * 0.12
+        if mob == 0:
+            val -= 4.0  # Trapped is catastrophic
+
+        # ---- 7. Prime stealing opportunity ----
+        if my_best_carpet >= 4:
+            val += 0.5
+
+        # ---- 8. Prime segment proximity (precomputed) ----
+        val += self._prime_proximity_adv
+
+        return val
+
+    # =========================================================================
+    # Move Ordering
+    # =========================================================================
+
+    def _score_move_fast(self, m, bs, my_x, my_y):
+        if m.move_type == MoveType.CARPET:
+            return 1000 + CARPET_PTS[min(m.roll_length, 7)] * 10
+        elif m.move_type == MoveType.PRIME:
+            dx, dy = DIR_DELTAS[m.direction]
+            nx, ny = my_x + dx, my_y + dy
+            if 0 <= nx < 8 and 0 <= ny < 8:
+                return 100 + self.static_potential[ny][nx]
+            return 100
+        else:  # PLAIN
+            dx, dy = DIR_DELTAS[m.direction]
+            nx, ny = my_x + dx, my_y + dy
+            if 0 <= nx < 8 and 0 <= ny < 8:
+                return self.static_potential[ny][nx]
+            return 0
+
+    def _order_moves(self, moves, bs):
+        my_x, my_y = bs.player_worker.get_location()
+        return sorted(moves, key=lambda m: self._score_move_fast(m, bs, my_x, my_y), reverse=True)
+
+    # =========================================================================
+    # Minimax with Alpha-Beta + Iterative Deepening
+    # =========================================================================
+
+    def _board_hash(self, bs):
+        return (
+            bs._primed_mask,
+            bs._carpet_mask,
+            bs.player_worker.position,
+            bs.opponent_worker.position,
+            bs.player_worker.get_points(),
+            bs.opponent_worker.get_points(),
+        )
+
+    def _minimax(self, bs, depth, is_my_turn, alpha, beta, deadline):
+        if time_module.perf_counter() > deadline:
+            return self._heuristic(bs, is_my_turn), None
+
+        if depth == 0 or bs.is_game_over():
+            return self._heuristic(bs, is_my_turn), None
+
+        bh = self._board_hash(bs)
+        tt_key = (bh, depth, is_my_turn)
+        tt_entry = self.tt.get(tt_key)
+        if tt_entry is not None:
+            return tt_entry
+
+        moves = bs.get_valid_moves()
+        if not moves:
+            return self._heuristic(bs, is_my_turn), None
+
+        moves = self._order_moves(moves, bs)
+        best_move = moves[0]
+
+        if is_my_turn:
+            best_val = float('-inf')
+            for m in moves:
+                if time_module.perf_counter() > deadline:
+                    break
+                child = bs.forecast_move(m, False)
+                if child is None:
+                    continue
+                child.reverse_perspective()
+                v, _ = self._minimax(child, depth - 1, False, alpha, beta, deadline)
+                if v > best_val:
+                    best_val = v
+                    best_move = m
+                if v > alpha:
+                    alpha = v
+                if beta <= alpha:
+                    break
+        else:
+            best_val = float('inf')
+            for m in moves:
+                if time_module.perf_counter() > deadline:
+                    break
+                child = bs.forecast_move(m, False)
+                if child is None:
+                    continue
+                child.reverse_perspective()
+                v, _ = self._minimax(child, depth - 1, True, alpha, beta, deadline)
+                if v < best_val:
+                    best_val = v
+                    best_move = m
+                if v < beta:
+                    beta = v
+                if beta <= alpha:
+                    break
+
+        result = (best_val, best_move)
+        self.tt[tt_key] = result
+        return result
+
+    def _iterative_deepening(self, board_state, moves, deadline, max_depth):
+        best_move = moves[0]
+        best_val = float('-inf')
+
+        for depth in range(1, max_depth + 1):
+            if time_module.perf_counter() > deadline:
+                break
+
+            current_best_move = moves[0]
+            current_best_val = float('-inf')
+            alpha = float('-inf')
+
+            for m in moves:
+                if time_module.perf_counter() > deadline:
+                    break
+                child = board_state.forecast_move(m, False)
+                if child is None:
+                    continue
+                child.reverse_perspective()
+                v, _ = self._minimax(
+                    child, depth - 1, False, alpha, float('inf'), deadline
+                )
+                if v > current_best_val:
+                    current_best_val = v
+                    current_best_move = m
+                if v > alpha:
+                    alpha = v
+
+            if current_best_val > float('-inf'):
+                best_val = current_best_val
+                best_move = current_best_move
+                moves = [best_move] + [m for m in moves if not self._moves_equal(m, best_move)]
+
+        return best_val, best_move
+
+    def _moves_equal(self, a, b):
+        if a.move_type != b.move_type:
+            return False
+        if a.move_type == MoveType.SEARCH:
+            return a.search_loc == b.search_loc
+        if a.direction != b.direction:
+            return False
+        if a.move_type == MoveType.CARPET:
+            return a.roll_length == b.roll_length
+        return True
+
+    # =========================================================================
+    # Rat Search Expected Value
+    # =========================================================================
+
+    def _evaluate_rat_search(self, board_state, best_movement_val, deadline, depth):
+        max_prob = float(self.belief.max())
+        best_rat_idx = int(np.argmax(self.belief))
+        rat_x, rat_y = best_rat_idx % 8, best_rat_idx // 8
+
+        score_diff = float(board_state.player_worker.get_points() - board_state.opponent_worker.get_points())
+        turns_left = board_state.player_worker.turns_left
+
+        # Dynamic threshold based on game state
+        if score_diff < -5:
+            threshold = 0.12  # Behind: take more risks
+        elif score_diff < 0:
+            threshold = 0.16
+        elif score_diff > 5 and turns_left <= 5:
+            threshold = 0.28  # Ahead late: be conservative
+        else:
+            threshold = 0.20
+
+        if max_prob < threshold:
+            return None
+
+        # Don't risk search if safely ahead with few turns left
+        if turns_left <= 2 and score_diff > 3:
+            return None
+
+        p = max_prob
+        raw_ev = p * 4.0 - (1.0 - p) * 2.0
+
+        if raw_ev < -0.5:
+            return None
+
+        if time_module.perf_counter() > deadline:
+            score_diff = float(board_state.player_worker.get_points() - board_state.opponent_worker.get_points())
+            incremental = best_movement_val - score_diff
+            if raw_ev > incremental:
+                return Move.search((rat_x, rat_y))
+            return None
+
+        search_depth = min(depth, 2)
+
+        success = board_state.get_copy()
+        success.player_worker.increment_points(4)
+        success.end_turn(0)
+        success.reverse_perspective()
+        sv, _ = self._minimax(
+            success, search_depth, False, float('-inf'), float('inf'), deadline
+        )
+
+        fail = board_state.get_copy()
+        fail.player_worker.decrement_points(2)
+        fail.end_turn(0)
+        fail.reverse_perspective()
+        fv, _ = self._minimax(
+            fail, search_depth, False, float('-inf'), float('inf'), deadline
+        )
+
+        search_val = p * sv + (1 - p) * fv
+        if search_val > best_movement_val:
+            return Move.search((rat_x, rat_y))
+
+        # Check top 3 locations
+        top3 = np.argsort(self.belief)[-3:][::-1]
+        for idx in top3:
+            prob = float(self.belief[idx])
+            if prob < 0.15:
+                break
+            ev = prob * sv + (1 - prob) * fv
+            if ev > best_movement_val:
+                rx, ry = idx % 8, idx // 8
+                return Move.search((rx, ry))
+
+        return None
+
+    # =========================================================================
+    # Main Play
+    # =========================================================================
+
+    def play(self, board_state, sensor_data, time_left):
+        if not self._init_ok:
+            moves = board_state.get_valid_moves()
+            return random.choice(moves) if moves else Move.search((0, 0))
+        try:
+            return self._real_play(board_state, sensor_data, time_left)
+        except Exception:
+            moves = board_state.get_valid_moves()
+            return random.choice(moves) if moves else Move.search((0, 0))
+
+    def _real_play(self, board_state, sensor_data, time_left):
+        self.turn_number += 1
+        self._update_hmm(board_state, sensor_data)
+        self._precompute_position_scores(board_state)
+
+        # --- Time management ---
+        # We have 240 seconds total for 40 turns = 6s/turn average
+        # Previous version only used ~31s total - way too conservative
+        remaining = time_left()
+        turns_remaining = max(board_state.player_worker.turns_left, 1)
+        per_turn = remaining / turns_remaining
+
+        # Time allocation: more in mid-game, conservative caps to avoid timeout
+        if turns_remaining <= 3:
+            budget = min(per_turn * 0.80, remaining * 0.25, 4.0)
+        elif turns_remaining <= 10:
+            budget = min(per_turn * 0.85, remaining * 0.12, 5.0)
+        elif turns_remaining <= 25:
+            # Mid-game: invest more time for deeper search
+            budget = min(per_turn * 0.85, remaining * 0.08, 5.5)
+        else:
+            # Early game: save time
+            budget = min(per_turn * 0.70, remaining * 0.05, 4.0)
+
+        budget = max(budget, 0.05)
+        if remaining < 10.0:
+            budget = min(budget, remaining * 0.15)
+        elif remaining < 30.0:
+            budget = min(budget, 1.5)
+
+        if budget > 4.0:
+            max_depth = 8
+        elif budget > 2.0:
+            max_depth = 7
+        elif budget > 1.0:
+            max_depth = 6
+        elif budget > 0.4:
+            max_depth = 5
+        elif budget > 0.15:
+            max_depth = 4
+        elif budget > 0.05:
+            max_depth = 3
+        else:
+            max_depth = 2
+
+        deadline = time_module.perf_counter() + budget
+
+        # --- Get moves ---
+        moves = board_state.get_valid_moves()
+        if not moves:
+            best_rat_idx = int(np.argmax(self.belief))
+            return Move.search((best_rat_idx % 8, best_rat_idx // 8))
+
+        moves = self._order_moves(moves, board_state)
+
+        # --- Iterative deepening search ---
+        self.tt.clear()
+        best_val, best_move = self._iterative_deepening(
+            board_state, moves, deadline, max_depth
+        )
+
+        # --- Rat search evaluation ---
+        search_move = self._evaluate_rat_search(
+            board_state, best_val, deadline, max_depth
+        )
+        if search_move is not None:
+            return search_move
+
         return best_move
-
-    def _immediate_value(self, move) -> float:
-        if move.move_type == MoveType.CARPET:
-            return float(CARPET_POINTS_TABLE.get(move.roll_length, 0))
-        elif move.move_type == MoveType.PRIME:
-            return 1.0
-        return 0.0
-
-    def _best_immediate_value(self, valid_moves) -> float:
-        """Return the best immediate point gain available from valid_moves."""
-        best = 0.0
-        for m in valid_moves:
-            v = self._immediate_value(m)
-            if v > best:
-                best = v
-        return best
